@@ -1,0 +1,1 @@
+call .\bld\build_win.x64.bat
