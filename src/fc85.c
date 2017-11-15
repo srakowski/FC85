@@ -14,7 +14,7 @@
 #define FGCOL             0xFF99C278
 
 #define NUM_SPRITES       256
-#define MAX_GAME_SIZE     16384
+#define MAX_FILE_SIZE     16384
 #define DISK_SIZE         163840
 
 #define FC_NAME           "FC-85"
@@ -35,14 +35,17 @@
 #define CLR_FLAG_CBUF   0x02
 #define CLR_FLAG_ALL    0xFF
 
-#define BTN_UP          0x80
-#define BTN_DOWN        0x40
-#define BTN_LEFT        0x20
-#define BTN_RIGHT       0x10
-#define BTN_START       0x08
-#define BTN_SELECT      0x04
-#define BTN_A           0x02
-#define BTN_B           0x01
+#define BTN_ESCP        0x0400
+#define BTN_RETN        0x0200
+#define BTN_BKSP        0x0100
+#define BTN_UP          0x0080
+#define BTN_DOWN        0x0040
+#define BTN_LEFT        0x0020
+#define BTN_RIGHT       0x0010
+#define BTN_START       0x0008
+#define BTN_SELECT      0x0004
+#define BTN_A           0x0002
+#define BTN_B           0x0001
 
 #define arraylen(x) (sizeof((x))/sizeof((x)[0]))
 
@@ -61,32 +64,46 @@ typedef union {
 } color;
 
 typedef struct {
+  byte name[16];
   byte sprt[NUM_SPRITES][8];
   byte font[256][8];
 } Assets;
 
-typedef union {
-  byte raw[MAX_GAME_SIZE];
-  struct {
-    Assets assets;
-    byte code[MAX_GAME_SIZE - sizeof(Assets)];
-  } map;
+typedef struct {
+  Assets assets;
+  byte code[MAX_FILE_SIZE - sizeof(Assets)];
 } Game;
+
+typedef byte GameData[sizeof(Game)];
+
+typedef struct {
+  char name[16];
+  void (*onPick)(void *menuItem, void *sys);
+} MenuItem;
 
 typedef struct {
   byte initialized;
   byte active;
   byte count;
   byte head;
-  struct {
-    char name[16];
-    void (*onPick)();
-  } items[32];
+  MenuItem items[32];
 } Menu;
 
 typedef struct {
-  byte name[5];
-  byte data[MAX_GAME_SIZE];
+  byte initialized;
+  byte startRow;
+  byte startCol;
+  byte maxlen;
+  byte count;
+  byte buffer[256];
+  byte cursorOn;
+  float cursorTimer;
+  void (*onReturn)(void *, void *);
+} TextInputBuffer;
+
+typedef struct {
+  byte name[16];
+  byte data[MAX_FILE_SIZE];
   void (*exe)(void *cmp, void *sys);
 } Component;
 
@@ -113,13 +130,21 @@ typedef struct {
 
 typedef struct {
   Display dsp;
-  byte mdlCnt;
+  byte count;
   struct {
     Module *mdl;
     void (*onPop)(Module *);
-  } mdlStk[8];
+  } moduleStack[8]; // the module stack
+  byte pCount;
+  struct {
+    Module *mdl;
+    void (*onPop)(Module *);
+  } pModuleStack[8]; // modules that have been popped and need to be cleaned up
   byte shutdown;
-  byte btns;
+  word btns; // btn map
+  float delta; // update time delta
+  byte tbuf[256]; // text input buffer
+  byte fswap[MAX_FILE_SIZE]; // file swap space for passing files between components
 } System;
 
 typedef struct Machine {
@@ -188,7 +213,7 @@ static void display_CLR(Display *dsp, byte flags) {
 void menu_HandleInput(Menu *menu, System *sys) {
   if (sys->btns & BTN_A)
   {
-    menu->items[menu->active].onPick();
+    menu->items[menu->active].onPick(&menu->items[menu->active], sys);
   }
   if (sys->btns & BTN_UP)
   {
@@ -216,7 +241,49 @@ void menu_Draw(Menu *menu, System *sys) {
     strncpy(name, menu->items[m].name, sizeof(name) - 3);
     display_STR(&sys->dsp, m+1, 2, name, STR_FLAG_NONE);
   }
-  display_RCBUF(&sys->dsp);
+}
+
+/* ------------------------------------------------------------------------- */
+// TEXT INPUT BUFFER
+/* ------------------------------------------------------------------------- */
+
+void textInputBuffer_HandleInput(TextInputBuffer *inp, System *sys) {
+  if (sys->btns & BTN_RETN) {
+    inp->onReturn(inp->buffer, sys);
+    return;
+  } else if (sys->btns & BTN_BKSP && inp->count > 0) {
+    inp->buffer[inp->count] = 0;
+    inp->count--;
+  } else {
+    // todo: maybe memcpy this instead
+    for (int c = 0; c < strlen(sys->tbuf) && 
+          inp->count < inp->maxlen && 
+          inp->count < sizeof(inp->buffer); c++) {
+      inp->buffer[inp->count] = sys->tbuf[c];
+      inp->count++;
+    }
+  }
+  inp->cursorTimer += sys->delta;
+  if (inp->cursorTimer > 0.5f) {
+    inp->cursorOn = !inp->cursorOn;
+    inp->cursorTimer = 0;
+  }
+}
+
+void textInputBuffer_Draw(TextInputBuffer *inp, System *sys) {
+  byte row = inp->startRow;
+  byte col = inp->startCol;
+  for (int c = 0; c < inp->count; c++) {
+    display_CH(&sys->dsp, row, col, inp->buffer[c], CH_FLAG_NONE);
+    col++;
+    if (col >= CHAR_CELL_COLS) {
+      col = 0;
+      row++;
+      // todo: rows too many? add shift up func to char cell display
+    }
+  }
+  // CURSOR
+  display_CH(&sys->dsp, row, col, 219, inp->cursorOn ? CH_FLAG_NONE : CH_FLAG_INVERT);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -263,58 +330,68 @@ static void module_Destroy(Module *self) {
 /* ------------------------------------------------------------------------- */
 
 static void system_PushModule(System *sys, Module *module, void (*onPop)(Module *)) {
-  sys->mdlStk[sys->mdlCnt].mdl = module;
-  sys->mdlStk[sys->mdlCnt].onPop = onPop;
-  sys->mdlCnt++;
+  sys->moduleStack[sys->count].mdl = module;
+  sys->moduleStack[sys->count].onPop = onPop;
+  sys->count++;
 }
 
 static void system_PopModule(System *sys) {
-  if (sys->mdlStk[sys->mdlCnt].onPop) {
-    sys->mdlStk[sys->mdlCnt].onPop(sys->mdlStk[sys->mdlCnt].mdl);
-  }
-  sys->mdlCnt--;
-  if (sys->mdlCnt < 0)
+  memcpy(&sys->pModuleStack[sys->pCount],
+    &sys->moduleStack[sys->count],
+    sizeof(sys->pModuleStack[sys->pCount])
+  );
+  sys->pCount++;
+  sys->count--;
+  if (sys->count < 0)
     sys->shutdown = true;
 }
 
-static void system_Tick(System *sys, float delta) {
+static void system_Tick(System *sys) {
   if (sys->shutdown)
     return;
 
-  Module* m = sys->mdlStk[sys->mdlCnt - 1].mdl;
-
-  if (sys->btns & BTN_RIGHT)
-  {
-    m->actvCmp++;
-    m->actvCmp = m->actvCmp >= m->cmpCnt 
-      ? m->cmpCnt - 1
-      : m->actvCmp;
-    if (m->actvCmp - m->visCmpHead >= 3)
-      m->visCmpHead++;
-  }
-
-  if (sys->btns & BTN_LEFT)
-  {
-    m->actvCmp--;
-    m->actvCmp = (sbyte)m->actvCmp < 0
-      ? 0
-      : m->actvCmp;
-    if (m->actvCmp < m->visCmpHead)
-      m->visCmpHead--;
-  }
-
   display_CLR(&sys->dsp, CLR_FLAG_ALL);
-
-  for (int c = m->visCmpHead, i = 0; c < m->cmpCnt && i < 3; c++, i++) {
-    display_STR(&sys->dsp, 0, (i * 5) + (m->visCmpHead > 0 ? 1 : 0), m->cmpLst[c].cmp->name, 
-      c == m->actvCmp ? STR_FLAG_INVERT : STR_FLAG_NONE);
+  
+  if (sys->btns & BTN_ESCP) {
+    system_PopModule(sys);
   }
 
-  if (m->cmpCnt - m->visCmpHead > 3) {
-    display_CH(&sys->dsp, 0, CHAR_CELL_COLS - 1, 240, CH_FLAG_NONE);
-  } 
-  if (m->visCmpHead > 0) {
-    display_CH(&sys->dsp, 0, 0, 240, CH_FLAG_NONE);
+  Module* m = sys->moduleStack[sys->count - 1].mdl;
+
+  if (m->cmpCnt > 1) {
+    if (sys->btns & BTN_RIGHT)
+    {
+      m->actvCmp++;
+      m->actvCmp = m->actvCmp >= m->cmpCnt 
+        ? m->cmpCnt - 1
+        : m->actvCmp;
+      if (m->actvCmp - m->visCmpHead >= 3)
+        m->visCmpHead++;
+    }
+
+    if (sys->btns & BTN_LEFT)
+    {
+      m->actvCmp--;
+      m->actvCmp = (sbyte)m->actvCmp < 0
+        ? 0
+        : m->actvCmp;
+      if (m->actvCmp < m->visCmpHead)
+        m->visCmpHead--;
+    }
+
+    for (int c = m->visCmpHead, i = 0; c < m->cmpCnt && i < 3; c++, i++) {
+      display_STR(&sys->dsp, 0, (i * 5) + (m->visCmpHead > 0 ? 1 : 0), m->cmpLst[c].cmp->name, 
+        c == m->actvCmp ? STR_FLAG_INVERT : STR_FLAG_NONE);
+    }
+
+    if (m->cmpCnt - m->visCmpHead > 3) {
+      display_CH(&sys->dsp, 0, CHAR_CELL_COLS - 1, 240, CH_FLAG_NONE);
+    } 
+    if (m->visCmpHead > 0) {
+      display_CH(&sys->dsp, 0, 0, 240, CH_FLAG_NONE);
+    }
+  } else {
+    display_STR(&sys->dsp, 0, 0, m->cmpLst[0].cmp->name, STR_FLAG_NONE);
   }
 
   display_RCBUF(&sys->dsp);
@@ -323,6 +400,13 @@ static void system_Tick(System *sys, float delta) {
     m->cmpLst[m->actvCmp].cmp,
     sys
   );
+
+  while (sys->pCount > 0) {
+    sys->pCount--;
+    if (sys->pModuleStack[sys->pCount].onPop) {
+      sys->pModuleStack[sys->pCount].onPop(sys->pModuleStack[sys->pCount].mdl);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -370,6 +454,7 @@ static void machine_Tick(Machine *m) {
   static Uint64 newTime = 0;
 
   m->sys.btns = 0x00;
+  memset(m->sys.tbuf, 0, sizeof(m->sys.tbuf));
 
   while (SDL_PollEvent(&event))
   {
@@ -378,16 +463,25 @@ static void machine_Tick(Machine *m) {
         case SDL_QUIT:
           m->sys.shutdown = true;
           break;
-        case SDL_KEYDOWN:
-          break;
         case SDL_KEYUP:
+          if (event.key.keysym.sym == SDLK_ESCAPE) m->sys.btns |= BTN_ESCP;
+          break;
+        case SDL_KEYDOWN:
           if (event.key.keysym.sym == SDLK_UP)    m->sys.btns |= BTN_UP;
           if (event.key.keysym.sym == SDLK_DOWN)  m->sys.btns |= BTN_DOWN;
           if (event.key.keysym.sym == SDLK_LEFT)  m->sys.btns |= BTN_LEFT;
           if (event.key.keysym.sym == SDLK_RIGHT) m->sys.btns |= BTN_RIGHT;
           if (event.key.keysym.sym == SDLK_z)     m->sys.btns |= BTN_A;
           if (event.key.keysym.sym == SDLK_x)     m->sys.btns |= BTN_B;
+          if (event.key.keysym.sym == SDLK_BACKSPACE) m->sys.btns |= BTN_BKSP;
+          if (event.key.keysym.sym == SDLK_RETURN) {
+              m->sys.btns |= BTN_RETN;
+              m->sys.btns |= BTN_A;
+          }
           break;
+        case SDL_TEXTINPUT:
+            strncpy(m->sys.tbuf, event.text.text, sizeof(m->sys.tbuf) - 1);
+            break;
       }
   }
 
@@ -395,7 +489,8 @@ static void machine_Tick(Machine *m) {
   float delta = (float)(newTime - oldTime) / 1000.0f;
   oldTime = newTime;
 
-  system_Tick(&m->sys, delta);
+  m->sys.delta = delta;
+  system_Tick(&m->sys);
 
   SDL_SetRenderDrawColor(m->renderer,
     0,
@@ -432,7 +527,6 @@ static void machine_Destroy(Machine *m) {
 /* ------------------------------------------------------------------------- */
 
 static void playGameComp_Exe(Component *, System *);
-static void playGameCompMenu_OnPick();
 static void newGameComp_Exe(Component *, System *);
 static void editGameComp_Exe(Component *, System *);
 
@@ -445,9 +539,8 @@ int main(int argc, char **argv) {
 
   Module *module = module_Create();
   module_AddComponent(module, component_Create("PLAY", playGameComp_Exe), component_Destroy);
-  module_AddComponent(module, component_Create("NEW", newGameComp_Exe), component_Destroy);
   module_AddComponent(module, component_Create("EDIT", editGameComp_Exe), component_Destroy);
-  module_AddComponent(module, component_Create("SYS", editGameComp_Exe), component_Destroy);
+  module_AddComponent(module, component_Create("NEW", newGameComp_Exe), component_Destroy);
   system_PushModule(&m->sys, module, module_Destroy);
 
   while (!m->sys.shutdown) machine_Tick(m);
@@ -461,28 +554,89 @@ int main(int argc, char **argv) {
 /* ------------------------------------------------------------------------- */
 
 static void playGameComp_Exe(Component *cmp, System *sys) {
-  Menu *mnu = (Menu *)cmp->data;
-  if (!mnu->initialized) {
-    mnu->count = 4;
-    strcpy(mnu->items[0].name, "Solbieski");
-    mnu->items[0].onPick = playGameCompMenu_OnPick;
-    strcpy(mnu->items[1].name, "CAVES");
-    mnu->items[0].onPick = playGameCompMenu_OnPick;
-    strcpy(mnu->items[2].name, "Drug Wars");
-    mnu->items[0].onPick = playGameCompMenu_OnPick;
-    strcpy(mnu->items[3].name, "Snake");
-    mnu->items[0].onPick = playGameCompMenu_OnPick;
+  Menu *menu = (Menu *)cmp->data;
+  if (!menu->initialized) {
   }
 
-  menu_HandleInput(mnu, sys);
-  menu_Draw(mnu, sys);
-}
-
-static void playGameCompMenu_OnPick() {
-  exit(EXIT_FAILURE);
+  menu_HandleInput(menu, sys);
+  menu_Draw(menu, sys);
+  display_RCBUF(&sys->dsp);
 }
 
 static void newGameComp_Exe(Component *cmp, System *sys) {
+  static void createGameMenuOption_OnPick(MenuItem *item, System *sys);
+  Menu *menu = (Menu *)cmp->data;
+  if (!menu->initialized) {
+    menu->count = 1;
+    strcpy(menu->items[0].name, "Create Game");
+    menu->items[0].onPick = createGameMenuOption_OnPick;
+    menu->initialized = true;
+  }
+  menu_HandleInput(menu, sys);
+  menu_Draw(menu, sys);
+  display_RCBUF(&sys->dsp);
+}
+
+static void createGameMenuOption_OnPick(MenuItem *item, System *sys) {
+  static void createGameComp_Exe(Component *, System *);
+  Module *module = module_Create();
+  module_AddComponent(module, component_Create("CREATE GAME", createGameComp_Exe), component_Destroy);
+  system_PushModule(sys, module, module_Destroy);
+}
+
+static void createGameComp_Exe(Component *cmp, System *sys) {
+  static void createGameNameTextInput_OnReturn(const char *input, System *sys);
+  TextInputBuffer *inp = (TextInputBuffer *)cmp->data;
+  if (!inp->initialized) {
+    inp->startRow = 1;
+    inp->startCol = 5;
+    inp->maxlen = 15;
+    inp->count = 0;
+    inp->cursorOn = true;
+    inp->cursorTimer = 0.0f;
+    inp->onReturn = createGameNameTextInput_OnReturn;
+    inp->initialized = true;
+  }
+  display_STR(&sys->dsp, 1, 0, "Name=", STR_FLAG_NONE);
+  textInputBuffer_HandleInput(inp, sys);
+  textInputBuffer_Draw(inp, sys);
+  display_RCBUF(&sys->dsp);
+}
+
+static void createGameNameTextInput_OnReturn(const char *input, System *sys) {
+  static void gameEditorComp_Exe(Component *, System *);
+
+  Game *game = (Game *)sys->fswap;
+  memset(game, 0, sizeof(Game));
+  strncpy(game->assets.name, input, sizeof(game->assets.name) - 1);
+  memcpy(game->assets.font, font_rom, sizeof(game->assets.font));
+
+  Module *module = module_Create();
+  char cmpName[16] = {'\0'};
+  strcpy(cmpName, "GAME:");
+  strncat(cmpName, input, sizeof(cmpName) - 1);
+  module_AddComponent(module, component_Create(cmpName, gameEditorComp_Exe), component_Destroy);
+  system_PopModule(sys);
+  system_PushModule(sys, module, module_Destroy);
+}
+
+static void gameEditorComp_Exe(Component *cmp, System *sys) {
+  Menu *menu = (Menu *)cmp->data;
+  if (!menu->initialized) {
+    byte itemCnt = 0;
+    strncpy(menu->items[itemCnt++].name, "Play", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Code Editor", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Sprite Editor", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Font Editor", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Save and Exit", sizeof(((MenuItem *)0)->name) - 1);
+    menu->count = itemCnt;
+    menu->initialized = true;
+  }
+  
+
+  menu_HandleInput(menu, sys);
+  menu_Draw(menu, sys);
+  display_RCBUF(&sys->dsp);
 }
 
 static void editGameComp_Exe(Component *cmp, System *sys) {
