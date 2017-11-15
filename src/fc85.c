@@ -8,6 +8,7 @@
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "rom.h"
 
 #define BGCOL             0xFF5C4530
@@ -75,6 +76,17 @@ typedef struct {
 } Game;
 
 typedef byte GameData[sizeof(Game)];
+
+typedef struct {
+  byte initialized;
+  int fileHead;
+  int fileLine;
+  int fileChar;
+  byte cursorOn;
+  float cursorTimer;
+  word codePos;
+  byte code[sizeof(((Game *)0)->code)];
+} CodeEditor;
 
 typedef struct {
   char name[16];
@@ -173,6 +185,11 @@ static void display_CH(Display *dsp, byte row, byte col, byte c, byte flags) {
   assert(dsp);
   dsp->cbuf[row][col].c = c;
   dsp->cbuf[row][col].flags = flags;
+}
+
+static byte display_GETCH(Display *dsp, byte row, byte col) {
+  assert(dsp);
+  return dsp->cbuf[row][col].c;
 }
 
 static void display_STR(Display *dsp, byte row, byte col, const char *str, byte flags) {
@@ -284,6 +301,91 @@ void textInputBuffer_Draw(TextInputBuffer *inp, System *sys) {
   }
   // CURSOR
   display_CH(&sys->dsp, row, col, 219, inp->cursorOn ? CH_FLAG_NONE : CH_FLAG_INVERT);
+}
+
+/* ------------------------------------------------------------------------- */
+// CODE EDITOR
+/* ------------------------------------------------------------------------- */
+
+void codeEditor_HandleInput(CodeEditor *self, System *sys) {
+  if (sys->btns & BTN_RETN) {
+    self->code[self->codePos] = ':';
+    self->codePos++;
+  } else if (sys->btns & BTN_BKSP && self->codePos > 1) {
+    self->codePos--;
+    self->code[self->codePos] = '\0';
+  }
+
+  for (int c = 0; c < strlen(sys->tbuf); c++) {
+    self->code[self->codePos] = sys->tbuf[c];
+    self->codePos++;
+  }
+
+  self->cursorTimer += sys->delta;
+  if (self->cursorTimer > 0.5f) {
+    self->cursorOn = !self->cursorOn;
+    self->cursorTimer = 0;
+  }
+}
+
+void codeEditor_Draw(CodeEditor *self, System *sys) {
+  int lineCount = 1;
+  struct {
+    byte *start;
+    int len;
+  } lines[sizeof(self->code) + 1];
+  lines[0].start = self->code;
+  int lineLen = 1;
+  for (int c = 1; c < sizeof(self->code) && c < strlen(self->code); c++) {
+    if (self->code[c] == ':') {
+      lines[lineCount - 1].len = lineLen;
+      lineLen = 0;
+      lines[lineCount].start = &self->code[c];
+      lineCount++;
+    }
+    lineLen++;
+  }
+  lines[lineCount - 1].len = lineLen;
+
+  int row = 0;
+  int col = 0;
+  for (int l = self->fileHead; l < lineCount && row < CHAR_CELL_ROWS; l++) {
+    row++;
+    col = 0;
+    for (int ch = 0; ch < lines[l].len; ch++) {
+      byte val = lines[l].start[ch];
+      display_CH(&sys->dsp, row, col, val, CH_FLAG_NONE);
+      col++;
+      if (col >= CHAR_CELL_COLS) {
+        col = 0;
+        row++;
+        if (row >= CHAR_CELL_ROWS) {
+          break;
+        }
+      }
+    }
+  }
+
+  // int row = 1;
+  // int col = 0;
+  // while (row < CHAR_CELL_ROWS && l < lineCount) {
+  //   for (int ch = 0; ch < (lines[l + 1] - lines[l]); ch++) {
+  //     byte val = lines[l][ch];
+  //     display_CH(&sys->dsp, row, col, val, CH_FLAG_NONE);
+  //     col++;
+  //     if (col >= CHAR_CELL_COLS) {
+  //       col = 0;
+  //       row++;
+  //       if (row >= CHAR_CELL_ROWS) {
+  //         break;
+  //       }
+  //     }
+  //   }
+  //   l++;
+  // }
+  display_CH(&sys->dsp, row, col, 
+    display_GETCH(&sys->dsp, row, col), 
+    self->cursorOn ? CH_FLAG_NONE : CH_FLAG_INVERT);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -563,6 +665,9 @@ static void playGameComp_Exe(Component *cmp, System *sys) {
   display_RCBUF(&sys->dsp);
 }
 
+static void editGameComp_Exe(Component *cmp, System *sys) {
+}
+
 static void newGameComp_Exe(Component *cmp, System *sys) {
   static void createGameMenuOption_OnPick(MenuItem *item, System *sys);
   Menu *menu = (Menu *)cmp->data;
@@ -610,9 +715,10 @@ static void createGameNameTextInput_OnReturn(const char *input, System *sys) {
   memset(game, 0, sizeof(Game));
   strncpy(game->assets.name, input, sizeof(game->assets.name) - 1);
   memcpy(game->assets.font, font_rom, sizeof(game->assets.font));
+  strcpy(game->code, ":");
 
   Module *module = module_Create();
-  char cmpName[16] = {'\0'};
+  char cmpName[32] = {'\0'};
   strcpy(cmpName, "GAME:");
   strncat(cmpName, input, sizeof(cmpName) - 1);
   module_AddComponent(module, component_Create(cmpName, gameEditorComp_Exe), component_Destroy);
@@ -621,23 +727,55 @@ static void createGameNameTextInput_OnReturn(const char *input, System *sys) {
 }
 
 static void gameEditorComp_Exe(Component *cmp, System *sys) {
+  static void playMenuOption_OnPick(MenuItem *item, System *sys);
+  static void editCodeMenuOption_OnPick(MenuItem *item, System *sys);
+  static void editSpritesMenuOption_OnPick(MenuItem *item, System *sys);
+  static void editFontMenuOption_OnPick(MenuItem *item, System *sys);
+
   Menu *menu = (Menu *)cmp->data;
   if (!menu->initialized) {
     byte itemCnt = 0;
     strncpy(menu->items[itemCnt++].name, "Play", sizeof(((MenuItem *)0)->name) - 1);
-    strncpy(menu->items[itemCnt++].name, "Code Editor", sizeof(((MenuItem *)0)->name) - 1);
-    strncpy(menu->items[itemCnt++].name, "Sprite Editor", sizeof(((MenuItem *)0)->name) - 1);
-    strncpy(menu->items[itemCnt++].name, "Font Editor", sizeof(((MenuItem *)0)->name) - 1);
-    strncpy(menu->items[itemCnt++].name, "Save and Exit", sizeof(((MenuItem *)0)->name) - 1);
+    menu->items[itemCnt].onPick = editCodeMenuOption_OnPick;
+    strncpy(menu->items[itemCnt++].name, "Edit Code", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Edit Sprites", sizeof(((MenuItem *)0)->name) - 1);
+    strncpy(menu->items[itemCnt++].name, "Edit Font", sizeof(((MenuItem *)0)->name) - 1);
     menu->count = itemCnt;
     menu->initialized = true;
   }
-  
 
   menu_HandleInput(menu, sys);
   menu_Draw(menu, sys);
   display_RCBUF(&sys->dsp);
 }
 
-static void editGameComp_Exe(Component *cmp, System *sys) {
+static void editCodeMenuOption_OnPick(MenuItem *item, System *sys) {
+  static void codeEditorComp_Exe(Component *, System *);
+  Module *module = module_Create();
+  char cmpName[32] = {'\0'};
+  strcpy(cmpName, "CODE:");
+  strncat(cmpName, ((Game *)sys->fswap)->assets.name, sizeof(cmpName) - 1);
+  module_AddComponent(module, component_Create(cmpName, codeEditorComp_Exe), component_Destroy);
+  system_PushModule(sys, module, module_Destroy);
 }
+
+static void codeEditorComp_Exe(Component *cmp, System *sys) {
+  CodeEditor *code = (CodeEditor *)cmp->data;
+  if (!code->initialized) {
+    code->fileHead = 0;
+    code->fileLine = 0;
+    code->fileChar = 0;
+    code->codePos = 1;
+    memcpy(code->code, ((Game *)(sys->fswap))->code, sizeof(code->code));
+    code->initialized = true;
+  }
+
+  codeEditor_HandleInput(code, sys);
+  codeEditor_Draw(code, sys);
+  display_RCBUF(&sys->dsp);
+
+  memcpy(((Game *)(sys->fswap))->code, code->code, sizeof(code->code));
+}
+
+// static void xMenuOption_OnPick(MenuItem *item, System *sys) {
+// }
