@@ -23,8 +23,11 @@
 #define FGCOL             0xFF99C278
 
 #define NUM_SPRITES           256
-#define MAX_FILE_SIZE         16384
 #define DISK_SIZE             163840
+#define DISK_BLOCK_SIZE       640
+#define MAX_FILE_SIZE         20480
+#define DISK_BLOCK_COUNT      (DISK_SIZE/DISK_BLOCK_SIZE)
+
 #define COMPONENT_MEMORY_SIZE 16384
 #define LUA_CODE_SIZE         65536
 
@@ -190,6 +193,28 @@ typedef struct {
 } Home;
 
 typedef struct {
+  byte blocks[DISK_BLOCK_COUNT][DISK_BLOCK_SIZE];
+} DiskMap;
+
+typedef struct {
+  int size;
+  byte name[16];
+  byte blocks[32];
+  byte ext[10]; //extension
+  byte blockCount;
+  byte init;
+} DiskFile;
+
+// 19x64 + 32 + 31 + 1 = 1280
+// 1280 = 2x640 = 254 blocks for user space
+typedef struct {
+  byte blocks[32]; // bitmap of used blocks
+  DiskFile files[19];
+  byte ext[31]; // for extension
+  byte init;
+} DiskHeader; 
+
+typedef struct {
   Display dsp;
   Home home;
   byte count;
@@ -207,6 +232,7 @@ typedef struct {
   float delta; // update time delta
   byte tbuf[256]; // text input buffer
   byte fswap[MAX_FILE_SIZE]; // file swap space for passing files between components
+  byte disk[DISK_SIZE];
 } System;
 
 typedef struct Machine {
@@ -214,7 +240,6 @@ typedef struct Machine {
   SDL_Window *window;
   SDL_Renderer *renderer;
   SDL_Texture *texture;
-  byte disk[DISK_SIZE];
 } Machine;
 
 Machine *_machine;
@@ -812,6 +837,100 @@ static void module_Destroy(Module *self) {
 }
 
 /* ------------------------------------------------------------------------- */
+// DISK
+/* ------------------------------------------------------------------------- */
+
+static void disk_Init(byte *disk) {
+  printf("f:%d\n", (int)sizeof(DiskFile));
+  printf("h:%d\n", (int)sizeof(DiskHeader));
+  assert(sizeof(DiskHeader) == (DISK_BLOCK_SIZE * 2));
+  memset(disk, 0, DISK_SIZE);
+  DiskHeader *hdr = (DiskHeader *)disk;
+  hdr->blocks[0] |= 0xC0; // 1100 0000 2 blocks for header
+  hdr->init = true;
+}
+
+static void disk_Save(byte *disk, const char *fileName, byte *data, int size) {
+  DiskMap *map = (DiskMap *)disk;
+  DiskHeader *hdr = (DiskHeader *)disk;
+  assert(hdr->init);
+  assert(size <= MAX_FILE_SIZE);
+  DiskFile *targetSlot = NULL;
+  DiskFile *existingSlot = NULL;
+  for (int i = 0; i < arraylen(hdr->files) && !existingSlot; i++) {
+    if (!targetSlot && hdr->files[i].name[0] == '\0') {
+      targetSlot = &hdr->files[i];
+    }
+    if (strncmp(hdr->files[i].name, fileName, sizeof(hdr->files[i].name)) == 0) {
+      existingSlot = &hdr->files[i];
+    }
+  }
+
+  if (existingSlot)
+  {
+    return;
+  }
+
+  assert(targetSlot);
+
+  // find blocks
+  memset(targetSlot->name, 0, sizeof(targetSlot->name));
+  strncpy(targetSlot->name, fileName, sizeof(targetSlot->name) - 1);
+  int blocksNeeded = (size / DISK_BLOCK_SIZE) + (((size % DISK_BLOCK_SIZE) > 0) ? 1 : 0);
+  targetSlot->size = size;
+  targetSlot->blockCount = blocksNeeded;
+  for (byte b = 0; b < DISK_BLOCK_COUNT && blocksNeeded > 0; b++) {
+    byte sector = b / 8;
+    byte blockInSector = b % 8;
+    byte mask = 0x80 >> blockInSector;
+    if (!(hdr->blocks[sector] & mask)) {
+      blocksNeeded--;
+      targetSlot->blocks[blocksNeeded] = b;
+    }
+  }
+
+  // todo: disk full?
+  assert(blocksNeeded == 0);
+
+  const char *dataPtr = data;
+  int dataRemaining = size;
+  for (byte b = 0; b < targetSlot->blockCount; b++) {
+    // record block as used
+    byte sector = targetSlot->blocks[b] / 8;
+    byte blockInSector = targetSlot->blocks[b] % 8;
+    byte mask = 0x80 >> blockInSector;
+    hdr->blocks[sector] |= mask;
+
+    // copy data to block
+    byte *blockData = map->blocks[targetSlot->blocks[b]];
+    memset(blockData, 0, DISK_BLOCK_SIZE);
+    memcpy(blockData, dataPtr, min(DISK_BLOCK_SIZE, dataRemaining));
+
+    // update positioning
+    dataPtr += DISK_BLOCK_SIZE;
+    dataRemaining -= DISK_BLOCK_SIZE;
+  }
+  printf("dr:%d\n", dataRemaining);
+  assert(dataRemaining <= 0);
+}
+
+DiskFile *disk_GetFile(byte *disk, bool reset) {
+  static byte file = 0;
+  if (reset) {
+    file = 0;
+  }
+  DiskFile *data = NULL;
+  DiskHeader *hdr = (DiskHeader *)disk;
+  while (file < arraylen(hdr->files) && data == NULL) {
+    if (hdr->files[file].name[0] != 0) {
+      data = &hdr->files[file];
+    }
+    file++;
+  }
+  return data;
+}
+
+/* ------------------------------------------------------------------------- */
 // SYSTEM
 /* ------------------------------------------------------------------------- */
 
@@ -868,6 +987,7 @@ static Machine *machine_Create() {
   m->sys.dsp.bgcol.value = BGCOL;
   m->sys.dsp.fgcol.value = FGCOL;
 
+  disk_Init(m->sys.disk);
 
   if (SDL_Init(SDL_INIT_VIDEO) < 0)
     exit(EXIT_FAILURE);
@@ -999,8 +1119,21 @@ int main(int argc, char **argv) {
 
 static void playGameComp_Exe(Component *cmp, System *sys) {
   Menu *menu = (Menu *)cmp->data;
-  if (!menu->initialized) {
+
+  for (int m = 0; m < arraylen(menu->items); m++) {
+    memset(&menu->items[m], 0, sizeof(menu->items[m]));
   }
+
+  byte itemCnt = 0;
+  DiskFile *fd = disk_GetFile(sys->disk, true);
+  while (fd != NULL)
+  {
+    char buffer[256] = {'\0'};
+    strncpy(buffer, fd->name, sizeof(fd->name));
+    strncpy(menu->items[itemCnt++].name, buffer, sizeof(((MenuItem *)0)->name) - 1);
+    fd = disk_GetFile(sys->disk, false);
+  }
+  menu->count = itemCnt;
 
   menu_HandleInput(menu, sys);
   menu_Draw(menu, sys);
@@ -1058,6 +1191,11 @@ static void createGameNameTextInput_OnReturn(const char *input, System *sys) {
   strncpy(game->assets.name, input, sizeof(game->assets.name) - 1);
   memcpy(game->assets.font, font_rom, sizeof(game->assets.font));
   strcpy(game->code, ":");
+
+  #pragma warning (disable : 4267)
+  int fileSize = (int)sizeof(game->assets) + strlen(game->code);
+
+  disk_Save(sys->disk, input, (byte *)game, fileSize);
 
   Module *module = module_Create(false);
   char cmpName[32] = {'\0'};
@@ -1146,7 +1284,7 @@ static void playComp_Exe(Component *cmp, System *sys) {
       home_Disp(&sys->home, sys, "Done");
       ctx->done = true;
     } else {
-      assert(0); /* something gone wrong with lua */
+      home_Disp(&sys->home, sys, "ERROR!");
     }
   }
 }
