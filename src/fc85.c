@@ -9,14 +9,16 @@
 #include <SDL.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <ctype.h>
 #include "rom.h"
 
 #define BGCOL             0xFF5C4530
 #define FGCOL             0xFF99C278
 
-#define NUM_SPRITES       256
-#define MAX_FILE_SIZE     16384
-#define DISK_SIZE         163840
+#define NUM_SPRITES           256
+#define MAX_FILE_SIZE         16384
+#define DISK_SIZE             163840
+#define COMPONENT_MEMORY_SIZE 65536
 
 #define FC_NAME           "FC-85"
 #define DISPLAY_WIDTH     96
@@ -49,6 +51,7 @@
 #define BTN_B           0x0001
 
 #define arraylen(x) (sizeof((x))/sizeof((x)[0]))
+#define cast(type, var) ((type)(var))
 
 typedef unsigned char byte;
 typedef signed char sbyte;
@@ -76,6 +79,56 @@ typedef struct {
 } Game;
 
 typedef byte GameData[sizeof(Game)];
+
+typedef enum {
+  TOKEN_INVALID = 0,
+  TOKEN_NUMBER,
+  TOKEN_IDENTIFIER,
+  TOKEN_STRING,
+  TOKEN_NOT,
+  TOKEN_STO,
+  TOKEN_AND,
+  TOKEN_DASH,
+  TOKEN_PLUS,
+  TOKEN_MULT,
+  TOKEN_DIVD,
+  TOKEN_LT,
+  TOKEN_GT,
+  TOKEN_EQ,
+  TOKEN_COLON,
+  TOKEN_SEMICOLON,
+  TOKEN_LEFT_PAREN,
+  TOKEN_RIGHT_PAREN,
+} TokenType;
+
+typedef enum {
+  DATA_TYPE_STRING,
+} DataType;
+
+typedef enum {
+  INSTRUCTION_CODE_INVALID,
+  INSTRUCTION_CODE_LODC,
+  INSTRUCTION_CODE_LODF,
+} InstructionCode;
+
+typedef enum {
+  InstructionCode code;
+  struct {
+    DataType type;
+    char data[256];
+  } value;
+} Instruction;
+
+typedef struct {
+  char name[256];
+} Symbol;
+
+typedef struct {
+  byte initialized;
+  byte *code;
+  byte *line;
+  
+} Interpreter;
 
 typedef struct {
   byte initialized;
@@ -115,7 +168,7 @@ typedef struct {
 
 typedef struct {
   byte name[16];
-  byte data[MAX_FILE_SIZE];
+  byte data[COMPONENT_MEMORY_SIZE];
   void (*exe)(void *cmp, void *sys);
 } Component;
 
@@ -221,6 +274,153 @@ static void display_CLR(Display *dsp, byte flags) {
     memset(dsp->fbuf, 0, sizeof(dsp->fbuf));
   if (flags & CLR_FLAG_CBUF)
     memset(dsp->cbuf, 0, sizeof(dsp->cbuf));
+}
+
+/* ------------------------------------------------------------------------- */
+// Interpreter
+/* ------------------------------------------------------------------------- */
+
+static void interpreter_Interpret(Interpreter *ctx, System *sys) {
+  static const char *tokenize(const char *code, TokenType *type);
+  static void system_PopModule(System *sys);
+
+  // grab a line
+  byte loc[256] = {'\0'};
+  byte *locPtr = loc;
+  do {
+    *locPtr = *ctx->line;
+    locPtr++; ctx->line++;
+  }
+  while (*ctx->line != '\0' && *ctx->line != ':');
+
+  if (strlen(loc) == 0) {
+    system_PopModule(sys);
+    return;
+  }
+
+  byte opStackCnt = 0;
+  Instruction opStack[32];
+  memset(&opStack, 0, sizeof(opstack));
+
+  byte exprStackCnt = 0;
+  InstructionCode exprStack[32];
+  memset(&exprStack, 0, sizeof(exprStack));
+
+  // tokenize, converting to rpn
+  TokenType type = TOKEN_INVALID;
+  const char *token = NULL;
+  token = tokenize(loc, &type);
+  while (token != NULL && type != TOKEN_INVALID) {
+
+    switch (token)
+    {
+      case TOKEN_STRING:
+        exprStack[exprStackCnt].code = INSTRUCTION_CODE_LODC;
+        exprStack[exprStackCnt].value.type = DATA_TYPE_STRING;
+        strncpy(exprStack[exprStackCnt].value.data, token, sizeof(exprStack[exprStackCnt].value.data) - 1);        
+        exprStackCnt++;
+        break;
+
+      case TOKEN_IDENTIFIER:
+
+        break;
+    }
+
+    printf("%d/%s\n", type, token);
+    token = tokenize(NULL, &type);
+  }
+
+
+
+}
+
+static const char *tokenize(const char *code, TokenType *type)
+{
+  static char token[256] = { '\0' };
+  static char *token_ptr = token;
+  static const char *scanner = NULL;
+
+  memset(token, 0, sizeof(token));
+  token_ptr = token;
+  *type = TOKEN_INVALID;
+
+  if (code != NULL)
+    scanner = code;
+
+  if (scanner == NULL)
+    return NULL;
+
+  while (isspace(*scanner) && *scanner != '\0')
+    scanner++;
+
+  if (*scanner == '\0')
+    return NULL;
+
+  if (isdigit(*scanner))
+  {
+    while (isdigit(*scanner)) // scan for number
+    {
+      *token_ptr = *scanner;
+      token_ptr++;
+      scanner++;
+    }
+    *type = TOKEN_NUMBER;
+    return token;
+  }
+
+  if (isalpha(*scanner) || *scanner == '_')
+  {
+    while ((isalnum(*scanner) || *scanner == '_') && *scanner != '\0')
+    {
+      *token_ptr = *scanner;
+      token_ptr++;
+      scanner++;
+    }
+
+    *type = TOKEN_IDENTIFIER;
+
+    return token;
+  }
+
+  if (*scanner == '"')
+  {
+    scanner++;
+    while (*scanner != '"' && *scanner != '\n' && *scanner != '\0')
+    {
+      *token_ptr = *scanner;
+      token_ptr++;
+      scanner++;
+    }
+
+    scanner += (*scanner != '\0' ? 1 : 0);
+
+    *type = TOKEN_STRING;
+    return token;
+  }
+
+  if (strchr("!|&-+*/<>=;:()", *scanner) != NULL)
+  {
+    *token_ptr = *scanner;
+    *type = *scanner == '!' ? TOKEN_NOT
+      : *scanner == '|' ? TOKEN_STO
+      : *scanner == '&' ? TOKEN_AND
+      : *scanner == '-' ? TOKEN_DASH
+      : *scanner == '+' ? TOKEN_PLUS
+      : *scanner == '*' ? TOKEN_MULT
+      : *scanner == '/' ? TOKEN_DIVD
+      : *scanner == '<' ? TOKEN_LT
+      : *scanner == '>' ? TOKEN_GT
+      : *scanner == '=' ? TOKEN_EQ
+      : *scanner == ':' ? TOKEN_COLON
+      : *scanner == ';' ? TOKEN_SEMICOLON
+      : *scanner == '(' ? TOKEN_LEFT_PAREN
+      : *scanner == ')' ? TOKEN_RIGHT_PAREN
+      : TOKEN_INVALID;
+    scanner++;
+    return token;
+  }
+
+  return token;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -366,23 +566,6 @@ void codeEditor_Draw(CodeEditor *self, System *sys) {
     }
   }
 
-  // int row = 1;
-  // int col = 0;
-  // while (row < CHAR_CELL_ROWS && l < lineCount) {
-  //   for (int ch = 0; ch < (lines[l + 1] - lines[l]); ch++) {
-  //     byte val = lines[l][ch];
-  //     display_CH(&sys->dsp, row, col, val, CH_FLAG_NONE);
-  //     col++;
-  //     if (col >= CHAR_CELL_COLS) {
-  //       col = 0;
-  //       row++;
-  //       if (row >= CHAR_CELL_ROWS) {
-  //         break;
-  //       }
-  //     }
-  //   }
-  //   l++;
-  // }
   display_CH(&sys->dsp, row, col, 
     display_GETCH(&sys->dsp, row, col), 
     self->cursorOn ? CH_FLAG_NONE : CH_FLAG_INVERT);
@@ -735,6 +918,7 @@ static void gameEditorComp_Exe(Component *cmp, System *sys) {
   Menu *menu = (Menu *)cmp->data;
   if (!menu->initialized) {
     byte itemCnt = 0;
+    menu->items[itemCnt].onPick = playMenuOption_OnPick;
     strncpy(menu->items[itemCnt++].name, "Play", sizeof(((MenuItem *)0)->name) - 1);
     menu->items[itemCnt].onPick = editCodeMenuOption_OnPick;
     strncpy(menu->items[itemCnt++].name, "Edit Code", sizeof(((MenuItem *)0)->name) - 1);
@@ -747,6 +931,14 @@ static void gameEditorComp_Exe(Component *cmp, System *sys) {
   menu_HandleInput(menu, sys);
   menu_Draw(menu, sys);
   display_RCBUF(&sys->dsp);
+}
+
+static void playMenuOption_OnPick(MenuItem *item, System *sys) {
+  static void playComp_Exe(Component *cmp, System *sys);
+  Module *module = module_Create();
+  char cmpName[32] = {'\0'};
+  module_AddComponent(module, component_Create("", playComp_Exe), component_Destroy);
+  system_PushModule(sys, module, module_Destroy);
 }
 
 static void editCodeMenuOption_OnPick(MenuItem *item, System *sys) {
@@ -766,7 +958,7 @@ static void codeEditorComp_Exe(Component *cmp, System *sys) {
     code->fileLine = 0;
     code->fileChar = 0;
     code->codePos = 1;
-    memcpy(code->code, ((Game *)(sys->fswap))->code, sizeof(code->code));
+    memcpy(code->code, cast(Game *, sys->fswap)->code, sizeof(code->code));
     code->initialized = true;
   }
 
@@ -777,5 +969,14 @@ static void codeEditorComp_Exe(Component *cmp, System *sys) {
   memcpy(((Game *)(sys->fswap))->code, code->code, sizeof(code->code));
 }
 
+static void playComp_Exe(Component *cmp, System *sys) {
+  Interpreter *ctx = cast(Interpreter *, cmp->data);
+  if (!ctx->initialized) {
+    ctx->code = cast(Game *, sys->fswap)->code;
+    ctx->line = cast(Game *, sys->fswap)->code;
+    ctx->initialized = true;
+  }
+  interpreter_Interpret(ctx, sys);
+}
 // static void xMenuOption_OnPick(MenuItem *item, System *sys) {
 // }
