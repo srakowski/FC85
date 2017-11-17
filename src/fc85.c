@@ -10,7 +10,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+#include <windows.h>
+
 #include "rom.h"
+
+#define TokenType MyTokenType
 
 #define BGCOL             0xFF5C4530
 #define FGCOL             0xFF99C278
@@ -18,7 +25,8 @@
 #define NUM_SPRITES           256
 #define MAX_FILE_SIZE         16384
 #define DISK_SIZE             163840
-#define COMPONENT_MEMORY_SIZE 65536
+#define COMPONENT_MEMORY_SIZE 16384
+#define LUA_CODE_SIZE         65536
 
 #define FC_NAME           "FC-85"
 #define DISPLAY_WIDTH     96
@@ -52,6 +60,10 @@
 
 #define arraylen(x) (sizeof((x))/sizeof((x)[0]))
 #define cast(type, var) ((type)(var))
+
+#define RUN_FUNC_NAME        "fc85run"
+#define DELTA_NAME           "fc85delta"
+#define YIELD_FUNC_NAME      "fc85yield"
 
 typedef unsigned char byte;
 typedef signed char sbyte;
@@ -97,37 +109,15 @@ typedef enum {
   TOKEN_EQ,
   TOKEN_COLON,
   TOKEN_SEMICOLON,
+  TOKEN_COMMA,
   TOKEN_LEFT_PAREN,
   TOKEN_RIGHT_PAREN,
 } TokenType;
 
-typedef enum {
-  DATA_TYPE_STRING,
-} DataType;
-
-typedef enum {
-  INSTRUCTION_CODE_INVALID,
-  INSTRUCTION_CODE_LODC,
-  INSTRUCTION_CODE_LODF,
-} InstructionCode;
-
-typedef enum {
-  InstructionCode code;
-  struct {
-    DataType type;
-    char data[256];
-  } value;
-} Instruction;
-
-typedef struct {
-  char name[256];
-} Symbol;
-
 typedef struct {
   byte initialized;
-  byte *code;
-  byte *line;
-  
+  byte done;
+  lua_State *lua;
 } Interpreter;
 
 typedef struct {
@@ -180,6 +170,7 @@ typedef struct {
   byte cmpCnt;
   byte actvCmp;
   byte visCmpHead;
+  byte isGame;
 } Module;
 
 typedef struct {
@@ -194,7 +185,13 @@ typedef struct {
 } Display;
 
 typedef struct {
+  byte buf[CHAR_CELL_ROWS][CHAR_CELL_COLS];
+  byte line;
+} Home;
+
+typedef struct {
   Display dsp;
+  Home home;
   byte count;
   struct {
     Module *mdl;
@@ -219,6 +216,8 @@ typedef struct Machine {
   SDL_Texture *texture;
   byte disk[DISK_SIZE];
 } Machine;
+
+Machine *_machine;
 
 /* ------------------------------------------------------------------------- */
 // DISPLAY
@@ -277,61 +276,212 @@ static void display_CLR(Display *dsp, byte flags) {
 }
 
 /* ------------------------------------------------------------------------- */
+// Home
+/* ------------------------------------------------------------------------- */
+
+void home_Reset(Home *home, System *sys) {
+  memset(home, 0, sizeof(home));
+}
+
+void home_Disp(Home *home, System *sys, const char *line) {
+  
+  char buffer[sizeof(home->buf[home->line]) + 1] = { '\0' };
+  strncpy(buffer, line, sizeof(home->buf[home->line]));
+  memcpy(home->buf[home->line], buffer, sizeof(home->buf[home->line]));
+  home->line++;
+
+  if (home->line == CHAR_CELL_ROWS)
+  {
+    for (int l = 0; l < CHAR_CELL_ROWS; l++) {
+      memset(home->buf[l], 0, sizeof(home->buf[l]));
+      if (l != CHAR_CELL_ROWS - 1) {
+        memcpy(home->buf[l], home->buf[l + 1], sizeof(home->buf[l]));
+      }
+    }
+    home->line--;
+  }
+
+  for (int l = 0; l < CHAR_CELL_ROWS; l++) {
+    for (int c = 0; c < CHAR_CELL_COLS; c++) {
+      display_CH(&sys->dsp, l, c, home->buf[l][c], CH_FLAG_NONE);
+    }
+  }
+
+  printf("display %s", line);
+  display_RCBUF(&sys->dsp);
+}
+
+/* ------------------------------------------------------------------------- */
+// Code to call!
+/* ------------------------------------------------------------------------- */
+
+static int Disp(lua_State *L)
+{
+    int argc = lua_gettop(L);
+    printf("Disp called %d args\n", argc);
+    for (int i = 1; i < argc + 1; i++) {
+      const char *val = luaL_checkstring(L, i);
+      home_Disp(&_machine->sys.home,
+        &_machine->sys,
+        val);
+    }
+    // int x = (int)luaL_checkinteger(L, 1);
+    // int y = (int)luaL_checkinteger(L, 2);
+    // const char *val = luaL_checkstring(L, 3);
+    // bool invert = false;
+    // if (argc >= 4)
+    // {
+    //     invert = (bool)lua_toboolean(L, 4);
+    // }
+    // out(x, y, val, invert);
+    return 0;
+}
+
+// static void Tick(lua_State *L, lua_Debug *ar) {
+//   Sleep(100);
+//   static void machine_Tick(Machine *m);
+//   machine_Tick(_machine);
+//   if (_machine->sys.shutdown) {
+//   }
+// }
+
+/* ------------------------------------------------------------------------- */
 // Interpreter
 /* ------------------------------------------------------------------------- */
 
-static void interpreter_Interpret(Interpreter *ctx, System *sys) {
+static int fc85yield(lua_State* L) {
+	return lua_yield(L, 0);
+}
+
+static void interpreter_Init(Interpreter *ctx, System *sys, const char *code) {
   static const char *tokenize(const char *code, TokenType *type);
   static void system_PopModule(System *sys);
 
-  // grab a line
-  byte loc[256] = {'\0'};
-  byte *locPtr = loc;
-  do {
-    *locPtr = *ctx->line;
-    locPtr++; ctx->line++;
-  }
-  while (*ctx->line != '\0' && *ctx->line != ':');
+  char *tcode = (char *)calloc(1, LUA_CODE_SIZE);
+  char lineBuffer[256] = {'\0'};
+  char swapBuffer[256] = {'\0'};
+  char *buffer = lineBuffer;
+  bool closeParen = false;
+  bool closeLbl = false;
 
-  if (strlen(loc) == 0) {
-    system_PopModule(sys);
-    return;
-  }
+  // IT'S TRANSPILER TIME!
 
-  byte opStackCnt = 0;
-  Instruction opStack[32];
-  memset(&opStack, 0, sizeof(opstack));
+  strncat(tcode, "function "RUN_FUNC_NAME"()\n", LUA_CODE_SIZE - strlen(tcode) - 1);
 
-  byte exprStackCnt = 0;
-  InstructionCode exprStack[32];
-  memset(&exprStack, 0, sizeof(exprStack));
-
-  // tokenize, converting to rpn
+  memset(lineBuffer, 0, sizeof(lineBuffer));
   TokenType type = TOKEN_INVALID;
   const char *token = NULL;
-  token = tokenize(loc, &type);
+  token = tokenize(code, &type);
   while (token != NULL && type != TOKEN_INVALID) {
-
-    switch (token)
+    printf("%d/%s/%s\n", type, token, closeParen ? "await)" : "");
+    switch (type)
     {
+      case TOKEN_STO:
+        if (closeParen) {
+          strncat(buffer, ")", LUA_CODE_SIZE - strlen(tcode) - 1);
+          closeParen = false;
+        }
+        buffer = swapBuffer;
+        break;
+
+      case TOKEN_COLON:
+        if (strlen(swapBuffer) > 0) {
+          strncat(tcode, swapBuffer, LUA_CODE_SIZE - strlen(tcode) - 1);
+          strncat(tcode, " = ", LUA_CODE_SIZE - strlen(tcode) - 1);
+        }
+        if (closeParen) {
+          strncat(lineBuffer, ")", LUA_CODE_SIZE - strlen(tcode) - 1);
+          closeParen = false;
+        } else if (closeLbl) {
+          strncat(lineBuffer, "::", LUA_CODE_SIZE - strlen(tcode) - 1);
+          closeLbl = false;
+        }
+        strncat(tcode, lineBuffer, LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(tcode, "\n", LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(tcode, YIELD_FUNC_NAME"()\n", LUA_CODE_SIZE - strlen(tcode) - 1);
+        memset(lineBuffer, 0, sizeof(lineBuffer));
+        memset(swapBuffer, 0, sizeof(swapBuffer));
+        buffer = lineBuffer;
+        break;
+
       case TOKEN_STRING:
-        exprStack[exprStackCnt].code = INSTRUCTION_CODE_LODC;
-        exprStack[exprStackCnt].value.type = DATA_TYPE_STRING;
-        strncpy(exprStack[exprStackCnt].value.data, token, sizeof(exprStack[exprStackCnt].value.data) - 1);        
-        exprStackCnt++;
+        strncat(buffer, " \"", LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(buffer, token, LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(buffer, "\" ", LUA_CODE_SIZE - strlen(tcode) - 1);
         break;
 
       case TOKEN_IDENTIFIER:
+        strncat(buffer, " ", LUA_CODE_SIZE - strlen(tcode) - 1);
+        if (strcmp(token, "Disp") == 0) {
+          strncat(buffer, token, LUA_CODE_SIZE - strlen(tcode) - 1);
+          strncat(buffer, "(", LUA_CODE_SIZE - strlen(tcode) - 1);
+          closeParen = true;
+        } else if (strcmp(token, "Lbl") == 0) {
+          strncat(buffer, "::", LUA_CODE_SIZE - strlen(tcode) - 1);
+          closeLbl = true;
+        } else if (strcmp(token, "Goto") == 0) {
+          strncat(buffer, "goto", LUA_CODE_SIZE - strlen(tcode) - 1);
+          strncat(buffer, " ", LUA_CODE_SIZE - strlen(tcode) - 1);
+        } else {
+          strncat(buffer, token, LUA_CODE_SIZE - strlen(tcode) - 1);
+          strncat(buffer, " ", LUA_CODE_SIZE - strlen(tcode) - 1);
+        }
+        break;
 
+      default:
+        strncat(buffer, " ", LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(buffer, token, LUA_CODE_SIZE - strlen(tcode) - 1);
+        strncat(buffer, " ", LUA_CODE_SIZE - strlen(tcode) - 1);
         break;
     }
-
-    printf("%d/%s\n", type, token);
     token = tokenize(NULL, &type);
   }
 
+  if (strlen(swapBuffer) > 0) {
+    strncat(tcode, swapBuffer, LUA_CODE_SIZE - strlen(tcode) - 1);
+    strncat(tcode, " = ", LUA_CODE_SIZE - strlen(tcode) - 1);
+  }
+  if (closeParen) {
+    strncat(lineBuffer, ")", LUA_CODE_SIZE - strlen(tcode) - 1);
+    closeParen = false;
+  } else if (closeLbl) {
+    strncat(lineBuffer, "::", LUA_CODE_SIZE - strlen(tcode) - 1);
+    closeLbl = false;
+  }
+  strncat(tcode, lineBuffer, LUA_CODE_SIZE - strlen(tcode) - 1);
+  strncat(tcode, "\nend\n", LUA_CODE_SIZE - strlen(tcode) - 1);
 
+  printf("%s", tcode);
 
+  home_Reset(&sys->home, sys);
+  
+  ctx->lua = luaL_newstate();
+  luaL_openlibs(ctx->lua);
+  
+  lua_register(ctx->lua, YIELD_FUNC_NAME, fc85yield);
+  
+  lua_pushcfunction(ctx->lua, Disp);
+  lua_setglobal(ctx->lua, "Disp");
+  // // lua_pushcfunction(L, lclr);
+  // // lua_setglobal(L, "clr");
+
+  if (luaL_loadstring(ctx->lua, tcode) != 0) {
+    // do error?
+    exit(EXIT_FAILURE);
+  }
+
+  free(tcode);
+
+  lua_pcall(ctx->lua, 0, LUA_MULTRET, 0);
+  
+  // int count = 0;
+  // lua_sethook(ctx->lua, Tick, LUA_MASKLINE, count);
+
+  lua_getglobal(ctx->lua, RUN_FUNC_NAME);
+  // lua_pcall(ctx->lua, 0, 0, 0);
+
+  ctx->initialized = true;
+  ctx->done = false;
 }
 
 static const char *tokenize(const char *code, TokenType *type)
@@ -398,7 +548,7 @@ static const char *tokenize(const char *code, TokenType *type)
     return token;
   }
 
-  if (strchr("!|&-+*/<>=;:()", *scanner) != NULL)
+  if (strchr("!|&-+*/<>=;:(),", *scanner) != NULL)
   {
     *token_ptr = *scanner;
     *type = *scanner == '!' ? TOKEN_NOT
@@ -415,6 +565,7 @@ static const char *tokenize(const char *code, TokenType *type)
       : *scanner == ';' ? TOKEN_SEMICOLON
       : *scanner == '(' ? TOKEN_LEFT_PAREN
       : *scanner == ')' ? TOKEN_RIGHT_PAREN
+      : *scanner == ',' ? TOKEN_COMMA
       : TOKEN_INVALID;
     scanner++;
     return token;
@@ -590,10 +741,60 @@ static void component_Destroy(Component *self) {
 // MODULE
 /* ------------------------------------------------------------------------- */
 
-static Module *module_Create() {
+static Module *module_Create(bool isGame) {
   Module *self = (Module *)calloc(1, sizeof(Module));
+  self->isGame = isGame;
   self->cmpCnt = 0;
   return self;
+}
+
+static void module_Tick(Module *m, System *sys) {
+  if (!m->isGame) {
+    display_CLR(&sys->dsp, CLR_FLAG_ALL);
+
+    if (m->cmpCnt > 1) {
+    
+      if (sys->btns & BTN_RIGHT)
+      {
+        m->actvCmp++;
+        m->actvCmp = m->actvCmp >= m->cmpCnt 
+          ? m->cmpCnt - 1
+          : m->actvCmp;
+        if (m->actvCmp - m->visCmpHead >= 3)
+          m->visCmpHead++;
+      }
+
+      if (sys->btns & BTN_LEFT)
+      {
+        m->actvCmp--;
+        m->actvCmp = (sbyte)m->actvCmp < 0
+          ? 0
+          : m->actvCmp;
+        if (m->actvCmp < m->visCmpHead)
+          m->visCmpHead--;
+      }
+
+      for (int c = m->visCmpHead, i = 0; c < m->cmpCnt && i < 3; c++, i++) {
+        display_STR(&sys->dsp, 0, (i * 5) + (m->visCmpHead > 0 ? 1 : 0), m->cmpLst[c].cmp->name, 
+          c == m->actvCmp ? STR_FLAG_INVERT : STR_FLAG_NONE);
+      }
+
+      if (m->cmpCnt - m->visCmpHead > 3) {
+        display_CH(&sys->dsp, 0, CHAR_CELL_COLS - 1, 240, CH_FLAG_NONE);
+      } 
+      if (m->visCmpHead > 0) {
+        display_CH(&sys->dsp, 0, 0, 240, CH_FLAG_NONE);
+      }
+    } else {
+      display_STR(&sys->dsp, 0, 0, m->cmpLst[0].cmp->name, STR_FLAG_NONE);
+    }
+    display_RCBUF(&sys->dsp);
+  }
+
+  m->cmpLst[m->actvCmp].cmp->exe(
+    m->cmpLst[m->actvCmp].cmp,
+    sys
+  );
 }
 
 static void module_AddComponent(Module *self, Component *cmp, void (*onDestroy)(Component *)) {  
@@ -635,56 +836,14 @@ static void system_Tick(System *sys) {
   if (sys->shutdown)
     return;
 
-  display_CLR(&sys->dsp, CLR_FLAG_ALL);
-  
   if (sys->btns & BTN_ESCP) {
     system_PopModule(sys);
+    return;
   }
 
   Module* m = sys->moduleStack[sys->count - 1].mdl;
 
-  if (m->cmpCnt > 1) {
-    if (sys->btns & BTN_RIGHT)
-    {
-      m->actvCmp++;
-      m->actvCmp = m->actvCmp >= m->cmpCnt 
-        ? m->cmpCnt - 1
-        : m->actvCmp;
-      if (m->actvCmp - m->visCmpHead >= 3)
-        m->visCmpHead++;
-    }
-
-    if (sys->btns & BTN_LEFT)
-    {
-      m->actvCmp--;
-      m->actvCmp = (sbyte)m->actvCmp < 0
-        ? 0
-        : m->actvCmp;
-      if (m->actvCmp < m->visCmpHead)
-        m->visCmpHead--;
-    }
-
-    for (int c = m->visCmpHead, i = 0; c < m->cmpCnt && i < 3; c++, i++) {
-      display_STR(&sys->dsp, 0, (i * 5) + (m->visCmpHead > 0 ? 1 : 0), m->cmpLst[c].cmp->name, 
-        c == m->actvCmp ? STR_FLAG_INVERT : STR_FLAG_NONE);
-    }
-
-    if (m->cmpCnt - m->visCmpHead > 3) {
-      display_CH(&sys->dsp, 0, CHAR_CELL_COLS - 1, 240, CH_FLAG_NONE);
-    } 
-    if (m->visCmpHead > 0) {
-      display_CH(&sys->dsp, 0, 0, 240, CH_FLAG_NONE);
-    }
-  } else {
-    display_STR(&sys->dsp, 0, 0, m->cmpLst[0].cmp->name, STR_FLAG_NONE);
-  }
-
-  display_RCBUF(&sys->dsp);
-
-  m->cmpLst[m->actvCmp].cmp->exe(
-    m->cmpLst[m->actvCmp].cmp,
-    sys
-  );
+  module_Tick(m, sys);
 
   while (sys->pCount > 0) {
     sys->pCount--;
@@ -820,17 +979,17 @@ static void editGameComp_Exe(Component *, System *);
 /* ------------------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
-  Machine *m = machine_Create();
+  _machine = machine_Create();
 
-  Module *module = module_Create();
+  Module *module = module_Create(false);
   module_AddComponent(module, component_Create("PLAY", playGameComp_Exe), component_Destroy);
   module_AddComponent(module, component_Create("EDIT", editGameComp_Exe), component_Destroy);
   module_AddComponent(module, component_Create("NEW", newGameComp_Exe), component_Destroy);
-  system_PushModule(&m->sys, module, module_Destroy);
+  system_PushModule(&_machine->sys, module, module_Destroy);
 
-  while (!m->sys.shutdown) machine_Tick(m);
+  while (!_machine->sys.shutdown) machine_Tick(_machine);
 
-  machine_Destroy(m);
+  machine_Destroy(_machine);
   exit(EXIT_SUCCESS);
 }
 
@@ -867,7 +1026,7 @@ static void newGameComp_Exe(Component *cmp, System *sys) {
 
 static void createGameMenuOption_OnPick(MenuItem *item, System *sys) {
   static void createGameComp_Exe(Component *, System *);
-  Module *module = module_Create();
+  Module *module = module_Create(false);
   module_AddComponent(module, component_Create("CREATE GAME", createGameComp_Exe), component_Destroy);
   system_PushModule(sys, module, module_Destroy);
 }
@@ -900,7 +1059,7 @@ static void createGameNameTextInput_OnReturn(const char *input, System *sys) {
   memcpy(game->assets.font, font_rom, sizeof(game->assets.font));
   strcpy(game->code, ":");
 
-  Module *module = module_Create();
+  Module *module = module_Create(false);
   char cmpName[32] = {'\0'};
   strcpy(cmpName, "GAME:");
   strncat(cmpName, input, sizeof(cmpName) - 1);
@@ -918,12 +1077,12 @@ static void gameEditorComp_Exe(Component *cmp, System *sys) {
   Menu *menu = (Menu *)cmp->data;
   if (!menu->initialized) {
     byte itemCnt = 0;
-    menu->items[itemCnt].onPick = playMenuOption_OnPick;
-    strncpy(menu->items[itemCnt++].name, "Play", sizeof(((MenuItem *)0)->name) - 1);
     menu->items[itemCnt].onPick = editCodeMenuOption_OnPick;
     strncpy(menu->items[itemCnt++].name, "Edit Code", sizeof(((MenuItem *)0)->name) - 1);
     strncpy(menu->items[itemCnt++].name, "Edit Sprites", sizeof(((MenuItem *)0)->name) - 1);
     strncpy(menu->items[itemCnt++].name, "Edit Font", sizeof(((MenuItem *)0)->name) - 1);
+    menu->items[itemCnt].onPick = playMenuOption_OnPick;
+    strncpy(menu->items[itemCnt++].name, "Play", sizeof(((MenuItem *)0)->name) - 1);
     menu->count = itemCnt;
     menu->initialized = true;
   }
@@ -935,7 +1094,7 @@ static void gameEditorComp_Exe(Component *cmp, System *sys) {
 
 static void playMenuOption_OnPick(MenuItem *item, System *sys) {
   static void playComp_Exe(Component *cmp, System *sys);
-  Module *module = module_Create();
+  Module *module = module_Create(true);
   char cmpName[32] = {'\0'};
   module_AddComponent(module, component_Create("", playComp_Exe), component_Destroy);
   system_PushModule(sys, module, module_Destroy);
@@ -943,7 +1102,7 @@ static void playMenuOption_OnPick(MenuItem *item, System *sys) {
 
 static void editCodeMenuOption_OnPick(MenuItem *item, System *sys) {
   static void codeEditorComp_Exe(Component *, System *);
-  Module *module = module_Create();
+  Module *module = module_Create(false);
   char cmpName[32] = {'\0'};
   strcpy(cmpName, "CODE:");
   strncat(cmpName, ((Game *)sys->fswap)->assets.name, sizeof(cmpName) - 1);
@@ -972,11 +1131,24 @@ static void codeEditorComp_Exe(Component *cmp, System *sys) {
 static void playComp_Exe(Component *cmp, System *sys) {
   Interpreter *ctx = cast(Interpreter *, cmp->data);
   if (!ctx->initialized) {
-    ctx->code = cast(Game *, sys->fswap)->code;
-    ctx->line = cast(Game *, sys->fswap)->code;
-    ctx->initialized = true;
+    interpreter_Init(ctx, sys, cast(Game *, sys->fswap)->code);
   }
-  interpreter_Interpret(ctx, sys);
+
+  if (!ctx->done) {
+
+    int ret = lua_resume(ctx->lua, NULL, 0);
+
+    if (ret == LUA_YIELD) {
+      printf("[ C ] Lua has yielded!\n");
+    } else if (ret == 0) {
+      lua_close(ctx->lua);
+      printf("[ C ] Lua has finished!\n");
+      home_Disp(&sys->home, sys, "Done");
+      ctx->done = true;
+    } else {
+      assert(0); /* something gone wrong with lua */
+    }
+  }
 }
 // static void xMenuOption_OnPick(MenuItem *item, System *sys) {
 // }

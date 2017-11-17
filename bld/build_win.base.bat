@@ -16,7 +16,9 @@ cl /TC /GL /WX /W3 /DEBUG /Zi /D "_CRT_SECURE_NO_WARNINGS"^
   /Fo:".\obj\win\%platform%\fc85.obj"^
   /Fe:".\bin\win\%platform%\fc85.exe"^
   /I ".\lib\sdl2\include"^
-  /link ".\lib\sdl2\lib\win\%platform%\SDL2.lib"
+  /I ".\lib\lua\include"^
+  /link ".\lib\sdl2\lib\win\%platform%\SDL2.lib"^
+  ".\lib\lua\lib\%platform%\lua53.lib"
 
 
 REM cl /TC /GL /WX /W3 /O2 /Os /D "_CRT_SECURE_NO_WARNINGS"^
