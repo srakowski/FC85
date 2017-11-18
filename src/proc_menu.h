@@ -16,12 +16,16 @@ typedef struct {
 
 typedef struct {
   byte name[MENU_TAB_NAME_SIZE];
-  byte itemsCnt;
+  byte head;
+  byte active;
+  byte count;
   MenuItem items[MENU_MAX_MENU_ITEMS];
 } MenuTab;
 
 typedef struct {
-  byte tabsCnt;
+  byte head;
+  byte active;
+  byte count;
   MenuTab tabs[MENU_MAX_TABS];
 } MenuProcess;
 
@@ -32,9 +36,88 @@ typedef struct {
 #define _proc_menu_c_
 /* ------------------------------------------------------------------------- */
 
+static void menuTab_AddItem(MenuTab *self, MenuItem *item)
+{
+  assert(self && item);
+  assert(self->count < MENU_MAX_MENU_ITEMS);
+  memcpy(&self->items[self->count], item, sizeof(MenuItem));
+  self->count++;
+}
+
+static void menuTab_HandleInput(MenuTab *self, System *sys)
+{
+  assert(self && sys);
+
+  if (sys->mem.inpt.btns & INPT_BTN_DOWN)
+  {
+    self->active++;
+    self->active = self->active >= self->count 
+      ? self->count - 1
+      : self->count;
+    if (self->active - self->head >= 3)
+      self->head++;
+  }
+
+  if (sys->mem.inpt.btns & INPT_BTN_UP)
+  {
+    self->active--;
+    self->active = (sbyte)self->active < 0
+      ? 0
+      : self->active;
+    if (self->active < self->head)
+      self->head--;
+  }
+
+  if (sys->mem.inpt.btns & INPT_BTN_A)
+  {
+    if (self->items[self->active].execute)
+    {
+      self->items[self->active].execute(
+        &self->items[self->active],
+        sys
+      );
+    }
+  }
+}
+
+static void menuProcess_AddTab(MenuProcess *self, MenuTab *tab)
+{
+  assert(self && tab);
+  assert(self->count < MENU_MAX_TABS);
+  memcpy(&self->tabs[self->count], tab, sizeof(MenuTab));
+  self->count++;
+}
+
+static void menuProcess_HandleInput(MenuProcess *self, System *sys)
+{
+  assert(self && sys);
+
+  if (sys->mem.inpt.btns & INPT_BTN_RIGHT)
+  {
+    self->active++;
+    self->active = self->active >= self->count 
+      ? self->count - 1
+      : self->count;
+    if (self->active - self->head >= 3)
+      self->head++;
+  }
+
+  if (sys->mem.inpt.btns & INPT_BTN_LEFT)
+  {
+    self->active--;
+    self->active = (sbyte)self->active < 0
+      ? 0
+      : self->active;
+    if (self->active < self->head)
+      self->head--;
+  }
+
+  menuTab_HandleInput(&self->tabs[self->active], sys);
+}
+
 static void menuProcess_Tick(MenuProcess *self, System *sys)
 {
-  
+  menuProcess_HandleInput(self, sys);
 }
 
 /* ------------------------------------------------------------------------- */

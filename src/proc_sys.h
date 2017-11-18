@@ -15,10 +15,28 @@ static void sysProcess_Execute(System *sys);
 #define _proc_sys_c_
 /* ------------------------------------------------------------------------- */
 
+static void sysProcess_menuItem_ShutdownExecute(MenuItem *self, System *sys)
+{
+  system_SetShutdownFlag(sys);
+}
+
 static SysProcess *sysProcess_Create()
 {
   SysProcess *self = (SysProcess *)calloc(1, sizeof(SysProcess));
   assert(self);
+
+  MenuTab tab;
+  MenuItem item;
+
+  memset(&tab, 0, sizeof(tab));
+  strncpy(tab.name, "FC-85:SYSTEM", sizeof(tab.name) - 1);
+
+  memset(&item, 0, sizeof(item));
+  strncpy(item.name, "Shutdown", sizeof(item.name) - 1);
+  item.execute = sysProcess_menuItem_ShutdownExecute;
+  menuTab_AddItem(&tab, &item);
+
+  menuProcess_AddTab(&self->base, &tab);
   return self;
 }
 

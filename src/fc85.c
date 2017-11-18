@@ -64,10 +64,13 @@
 /* ------------------------------------------------------------------------- */
 
 typedef unsigned char byte;
+typedef signed char sbyte;
 
 typedef unsigned short word;
+typedef signed short sword;
 
 typedef unsigned int dword;
+typedef signed int sdword;
 
 typedef union {
   int value;
