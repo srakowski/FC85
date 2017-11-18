@@ -80,6 +80,19 @@ static void menuTab_HandleInput(MenuTab *self, System *sys)
   }
 }
 
+static void menuTab_Draw(MenuTab *self, System *sys)
+{
+  for (int m = 0; m < self->count; m++) {
+    char name[17] = {'\0'};
+    sprintf(name, "%d:", (m + 1) < 10 ? (m + 1) : 0);
+    _output(sys, m+1, 0, name, 
+      m == self->active ? DISP_FLAG_INVERT : DISP_FLAG_NONE);
+    
+    strncpy(name, self->items[m].name, sizeof(name) - 3);
+    _output(sys, m+1, 2, name, DISP_FLAG_NONE);
+  }
+}
+
 static void menuProcess_AddTab(MenuProcess *self, MenuTab *tab)
 {
   assert(self && tab);
@@ -115,9 +128,42 @@ static void menuProcess_HandleInput(MenuProcess *self, System *sys)
   menuTab_HandleInput(&self->tabs[self->active], sys);
 }
 
+static void menuProcess_Draw(MenuProcess *self, System *sys)
+{
+  _clearHome(sys);
+
+  if (self->count > 1) 
+  {
+    for (byte c = self->head, i = 0; c < self->count; c++, i++) 
+    {
+      bool isActiveTab = c == self->active;
+      MenuTab *tab = (MenuTab *)&self->tabs[c];
+      char tabNameBuffer[5] = {'\0'};
+      strncpy(tabNameBuffer, tab->name, sizeof(tabNameBuffer) - 1);
+      _output(sys, 0, (i * 5) + (self->head > 0 ? 1 : 0), 
+        tabNameBuffer, isActiveTab ? DISP_FLAG_INVERT : DISP_FLAG_NONE);
+      menuTab_Draw(tab, sys);
+    }
+
+    if (self->count - self->head > 3) {
+      _outputc(sys, 0, DISP_CHAR_CELL_COLS - 1, 240, DISP_FLAG_NONE);
+    }
+
+    if (self->head > 0) {
+      _outputc(sys, 0, 0, 240, DISP_FLAG_NONE);
+    }
+  }
+  else 
+  {
+    _output(sys, 0, 0, self->tabs[0].name, DISP_FLAG_INVERT);
+    menuTab_Draw(&self->tabs[0], sys);
+  }
+}
+
 static void menuProcess_Tick(MenuProcess *self, System *sys)
 {
   menuProcess_HandleInput(self, sys);
+  menuProcess_Draw(self, sys);
 }
 
 /* ------------------------------------------------------------------------- */

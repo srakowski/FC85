@@ -29,7 +29,7 @@ static SysProcess *sysProcess_Create()
   MenuItem item;
 
   memset(&tab, 0, sizeof(tab));
-  strncpy(tab.name, "FC-85:SYSTEM", sizeof(tab.name) - 1);
+  strncpy(tab.name, "FC-85:SYS", sizeof(tab.name) - 1);
 
   memset(&item, 0, sizeof(item));
   strncpy(item.name, "Shutdown", sizeof(item.name) - 1);

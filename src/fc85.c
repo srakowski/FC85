@@ -32,6 +32,11 @@
 #define DISP_CHAR_HEIGHT_PIXELS 8
 #define DISP_CHAR_CELL_ROWS     (DISP_HEIGHT_PIXELS/DISP_CHAR_HEIGHT_PIXELS)
 #define DISP_CHAR_CELL_COLS     (DISP_WIDTH_PIXELS/DISP_CHAR_WIDTH_PIXELS)
+#define DISP_FLAG_NONE          0x00
+#define DISP_FLAG_INVERT        0x01
+#define DISP_FLAG_CHAR_MODE     0x02
+#define DISP_DEFAULT_FG_COL     0xFF78C299
+#define DISP_DEFAULT_BG_COL     0xFF5C4530
 
 #define INPT_BTN_POWR           0x0800
 #define INPT_BTN_ESCP           0x0400
@@ -73,11 +78,12 @@ typedef unsigned int dword;
 typedef signed int sdword;
 
 typedef union {
-  int value;
+  dword value;
   struct {
     byte b;
     byte g;
     byte r;
+    byte a;
   } rgb;
 } Color;
 
@@ -97,10 +103,11 @@ typedef struct {
       Color foreground;
       Color background;
       byte buffer[DISP_HEIGHT_PIXELS][DISP_WIDTH_PIXELS/DISP_PIXELS_PER_BYTE];
-      struct {
+      struct _charCell {
         byte value;
         byte flags;
       } charCells[DISP_CHAR_CELL_ROWS][DISP_CHAR_CELL_COLS];
+      byte font[256][8];
     } disp;
     struct _disk {
       byte flags;
@@ -153,7 +160,52 @@ typedef struct {
 } FC85;
 
 /* ------------------------------------------------------------------------- */
-// Process Headers
+// Static Data Headers
+/* ------------------------------------------------------------------------- */
+
+#include "font.h"
+
+/* ------------------------------------------------------------------------- */
+// System Api
+/* ------------------------------------------------------------------------- */
+
+static void _setPixel(System *sys, byte y, byte x, byte on)
+{
+  assert(sys);
+  byte px = x / 8;
+  byte bx = x % 8;
+  if (on)
+    sys->mem.disp.buffer[y][px] |= (0x80 >> bx);
+  else
+    sys->mem.disp.buffer[y][px] &= ((0x80 >> bx) ^ 0xFF);
+}
+
+static void _clearHome(System *sys)
+{
+  assert(sys);
+  sys->mem.disp.flags |= DISP_FLAG_CHAR_MODE;
+  memset(sys->mem.disp.charCells, 0, sizeof(sys->mem.disp.charCells));
+}
+
+static void _outputc(System *sys, byte row, byte col, byte value, byte flags)
+{
+  assert(sys);
+  sys->mem.disp.flags |= DISP_FLAG_CHAR_MODE;
+  if (row >= DISP_CHAR_CELL_ROWS || col >= DISP_CHAR_CELL_COLS) return;
+  sys->mem.disp.charCells[row][col].value = value;
+  sys->mem.disp.charCells[row][col].flags = flags;
+}
+
+static void _output(System *sys, byte row, byte col, byte *value, byte flags)
+{
+  assert(sys);
+  sys->mem.disp.flags |= DISP_FLAG_CHAR_MODE;
+  for (byte i = 0, c = col; i < strlen(value); i++, c++)
+    _outputc(sys, row, c, value[i], flags);
+}
+
+/* ------------------------------------------------------------------------- */
+// Process and Data Headers
 /* ------------------------------------------------------------------------- */
 
 #undef FC85_PROC_IMPLEMENTATIONS
@@ -236,6 +288,12 @@ static void system_PopProc(System *self)
 static void system_Boot(System *self) 
 {
   memset(self, 0, sizeof(System));
+
+  self->mem.disp.foreground.value = DISP_DEFAULT_FG_COL;
+  self->mem.disp.background.value = DISP_DEFAULT_BG_COL;
+  memcpy(self->mem.disp.font, font, 
+    min(sizeof(self->mem.disp.font), sizeof(font)));
+
   sysProcess_Execute(self);
 }
 
@@ -311,6 +369,26 @@ void displayDevice_Dispose(DisplayDevice *self)
 void displayDevice_Refresh(DisplayDevice *self, System *sys) 
 {
   static int pixels[DISP_WIDTH_PIXELS * DISP_HEIGHT_PIXELS];
+
+  if (sys->mem.disp.flags & DISP_FLAG_CHAR_MODE)
+  {
+    for (int r = 0; r < DISP_CHAR_CELL_ROWS; r++)
+    for (int c = 0; c < DISP_CHAR_CELL_COLS; c++)
+    {
+      struct _charCell *cell = &sys->mem.disp.charCells[r][c];
+      byte *fontChar = sys->mem.disp.font[cell->value];
+      byte dy = r * DISP_CHAR_HEIGHT_PIXELS;
+      byte dx = c * DISP_CHAR_WIDTH_PIXELS;
+      for (int cy = 0; cy < DISP_CHAR_HEIGHT_PIXELS; cy++)
+      for (int cx = 0; cx < DISP_CHAR_WIDTH_PIXELS; cx++)
+      {
+        byte on = (fontChar[cy] & (0x80 >> cx));
+        on = (sys->mem.disp.flags & DISP_FLAG_INVERT) ? !on : on;
+        on = (cell->flags & DISP_FLAG_INVERT) ? !on : on;
+        _setPixel(sys, dy + cy, dx + cx, on);
+      }
+    }
+  }
 
   SDL_SetRenderDrawColor(self->renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
   SDL_RenderClear(self->renderer);
