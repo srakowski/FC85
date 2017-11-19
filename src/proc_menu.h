@@ -1,3 +1,4 @@
+#ifndef FC85_PROC_IMPLEMENTATIONS
 #ifndef _proc_menu_h_
 #define _proc_menu_h_
 /* ------------------------------------------------------------------------- */
@@ -31,6 +32,7 @@ typedef struct {
 
 /* ------------------------------------------------------------------------- */
 #endif
+#endif
 #ifdef FC85_PROC_IMPLEMENTATIONS
 #ifndef _proc_menu_c_
 #define _proc_menu_c_
@@ -52,9 +54,13 @@ static void menuTab_HandleInput(MenuTab *self, System *sys)
   {
     self->active++;
     self->active = self->active >= self->count 
-      ? self->count - 1
-      : self->count;
-    if (self->active - self->head >= 3)
+      ? 0
+      : self->active;
+
+    if (self->active < self->head)
+      self->head = self->active;
+
+    if (self->active - self->head >= 7)
       self->head++;
   }
 
@@ -62,10 +68,14 @@ static void menuTab_HandleInput(MenuTab *self, System *sys)
   {
     self->active--;
     self->active = (sbyte)self->active < 0
-      ? 0
+      ? self->count - 1
       : self->active;
-    if (self->active < self->head)
-      self->head--;
+
+    while (self->active - self->head >= 7)
+      self->head++;
+
+    if ((sbyte)self->active < (sbyte)self->head)
+      self->head = self->active;
   }
 
   if (sys->mem.inpt.btns & INPT_BTN_A)
@@ -82,13 +92,14 @@ static void menuTab_HandleInput(MenuTab *self, System *sys)
 
 static void menuTab_Draw(MenuTab *self, System *sys)
 {
-  for (int m = 0; m < self->count; m++) {
+  for (int m = 0, i = self->head; i < self->count; m++, i++) 
+  {
     char name[17] = {'\0'};
-    sprintf(name, "%d:", (m + 1) < 10 ? (m + 1) : 0);
+    sprintf(name, "%d:", (i + 1) < 10 ? (i + 1) : 0);
     _output(sys, m+1, 0, name, 
-      m == self->active ? DISP_FLAG_INVERT : DISP_FLAG_NONE);
+      i == self->active ? DISP_FLAG_INVERT : DISP_FLAG_NONE);
     
-    strncpy(name, self->items[m].name, sizeof(name) - 3);
+    strncpy(name, self->items[i].name, sizeof(name) - 3);
     _output(sys, m+1, 2, name, DISP_FLAG_NONE);
   }
 }
@@ -110,7 +121,7 @@ static void menuProcess_HandleInput(MenuProcess *self, System *sys)
     self->active++;
     self->active = self->active >= self->count 
       ? self->count - 1
-      : self->count;
+      : self->active;
     if (self->active - self->head >= 3)
       self->head++;
   }
@@ -130,7 +141,7 @@ static void menuProcess_HandleInput(MenuProcess *self, System *sys)
 
 static void menuProcess_Draw(MenuProcess *self, System *sys)
 {
-  _clearHome(sys);
+  _clrHome(sys);
 
   if (self->count > 1) 
   {
@@ -142,7 +153,8 @@ static void menuProcess_Draw(MenuProcess *self, System *sys)
       strncpy(tabNameBuffer, tab->name, sizeof(tabNameBuffer) - 1);
       _output(sys, 0, (i * 5) + (self->head > 0 ? 1 : 0), 
         tabNameBuffer, isActiveTab ? DISP_FLAG_INVERT : DISP_FLAG_NONE);
-      menuTab_Draw(tab, sys);
+      if (isActiveTab)
+        menuTab_Draw(tab, sys);
     }
 
     if (self->count - self->head > 3) {
